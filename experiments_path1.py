@@ -102,7 +102,7 @@ def run_experiment(cfg, train_cfg):
         **cfg["ds_kwargs"],
     )
     ds_train = SyntheticEdgeDataset(length=train_cfg["steps"]*train_cfg["batch"]*train_cfg["epochs"], **ds_kw)
-    ds_val   = SyntheticEdgeDataset(length=200, seed=999, **{**ds_kw, "seed": 999})
+    ds_val   = SyntheticEdgeDataset(**{**ds_kw, "length": 200, "seed": 999})
 
     model     = UNet(in_ch=3, out_ch=1, base_ch=train_cfg["base_ch"])
     optimizer = Adam(model.parameters(), lr=train_cfg["lr"], weight_decay=1e-4)
