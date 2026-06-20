@@ -1,11 +1,23 @@
 """
-ByteTrack-style multi-object tracker.
-Associates detections across frames using Kalman filter + IoU cost.
+Two trackers:
+
+ByteTracker      — original bbox-IoU + Kalman tracker (kept for reference).
+FlowPointTracker — feature-point tracker driven by optical flow (FlowNetC).
+
+FlowPointTracker pipeline per frame pair (t → t+1):
+  1. Detect keypoints in frame_t  → positions {p_i}
+  2. FlowNet(frame_t, frame_t+1)  → dense flow field F (dx, dy per pixel)
+  3. Propagate: p_i^{t+1} = p_i^t + F(p_i^t)   (bilinear sampling of F)
+  4. Detect keypoints in frame_t+1 → new positions {q_j}
+  5. Match {propagated p_i} ↔ {q_j} by Euclidean distance (Hungarian)
+  6. Update confirmed tracks; init new tracks from unmatched q_j
 """
 import numpy as np
+import torch
+import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 from filterpy.kalman import KalmanFilter
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 
 def _iou(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -168,3 +180,161 @@ class ByteTracker:
                 if iou > self.iou_threshold:
                     return True
         return False
+
+
+# ---------------------------------------------------------------------------
+# FlowPointTracker
+# ---------------------------------------------------------------------------
+
+class PointTrack:
+    """Single tracked feature point."""
+    _id_counter = 0
+
+    def __init__(self, xy: np.ndarray, score: float, kp_type: int):
+        PointTrack._id_counter += 1
+        self.id    = PointTrack._id_counter
+        self.xy    = xy.copy()          # (2,) float
+        self.type  = kp_type
+        self.hits  = 1
+        self.age   = 0
+        self.miss  = 0
+        self.confirmed = False
+
+    def update(self, xy: np.ndarray):
+        self.xy   = xy.copy()
+        self.hits += 1
+        self.miss  = 0
+
+    def mark_missed(self):
+        self.miss += 1
+        self.age  += 1
+
+
+def _sample_flow_at_points(flow: torch.Tensor, points: np.ndarray) -> np.ndarray:
+    """
+    Bilinearly sample a flow field at (x, y) pixel positions.
+
+    Args:
+        flow   : (1, 2, H, W) flow tensor on some device
+        points : (N, 2) array of (x, y) coordinates in pixel space
+
+    Returns:
+        sampled : (N, 2) array of (dx, dy) values
+    """
+    if len(points) == 0:
+        return np.empty((0, 2), dtype=np.float32)
+
+    _, _, H, W = flow.shape
+    pts = torch.from_numpy(points).float().to(flow.device)
+
+    # Normalise to [-1, 1] grid for grid_sample
+    norm_x = (pts[:, 0] / (W - 1)) * 2 - 1
+    norm_y = (pts[:, 1] / (H - 1)) * 2 - 1
+    grid   = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(0).unsqueeze(0)  # (1,1,N,2)
+
+    sampled = F.grid_sample(flow, grid, mode="bilinear", align_corners=True)  # (1,2,1,N)
+    return sampled[0, :, 0, :].T.cpu().numpy()  # (N, 2)
+
+
+def _distance_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Euclidean distance matrix between point sets a (N,2) and b (M,2)."""
+    diff = a[:, None, :] - b[None, :, :]   # (N, M, 2)
+    return np.sqrt((diff ** 2).sum(-1))     # (N, M)
+
+
+class FlowPointTracker:
+    """
+    Feature-point tracker that uses optical flow (FlowNetC) to propagate
+    tracked keypoints across frames instead of IoU-based box matching.
+
+    Usage (inference loop):
+        tracker = FlowPointTracker(flownet, dist_threshold=8.0)
+        for frame_t, frame_t1 in frame_pairs:
+            kp_t1 = detector.predict_keypoints(frame_t1)
+            tracks = tracker.update(frame_t, frame_t1, kp_t1)
+    """
+
+    def __init__(
+        self,
+        flownet,                      # FlowNetC instance (already on device)
+        dist_threshold: float = 12.0, # max pixel distance to match a propagated point
+        max_miss:       int   = 5,    # frames without match before dropping track
+        min_hits:       int   = 2,    # hits before confirming track
+    ):
+        self.flownet        = flownet
+        self.dist_threshold = dist_threshold
+        self.max_miss       = max_miss
+        self.min_hits       = min_hits
+        self.tracks: List[PointTrack] = []
+        PointTrack._id_counter = 0
+
+    def update(
+        self,
+        frame_t:  torch.Tensor,   # (1, 3, H, W) normalised, on device
+        frame_t1: torch.Tensor,   # (1, 3, H, W) normalised, on device
+        detections_t1: dict,      # output of KeypointHead.decode for frame_t+1
+                                  # {"coords": (N,2), "scores": (N,), "types": (N,)}
+    ) -> List[dict]:
+        """
+        Args:
+            frame_t        : current frame (tensor, already on model device)
+            frame_t1       : next frame
+            detections_t1  : keypoints detected in frame_t+1
+
+        Returns:
+            List of active track dicts:
+                id     : int
+                xy     : (2,) ndarray  (x, y) pixel coords in frame_t+1
+                type   : int  keypoint type
+                hits   : int
+        """
+        self.flownet.eval()
+        with torch.no_grad():
+            flow = self.flownet.infer(frame_t, frame_t1)  # (1, 2, H, W)
+
+        det_xy    = detections_t1["coords"].cpu().numpy()   # (M, 2)
+        det_types = detections_t1["types"].cpu().numpy()    # (M,)
+
+        # --- Step 1: propagate existing tracks via flow ---
+        if self.tracks:
+            prev_xy  = np.stack([t.xy for t in self.tracks])    # (N, 2)
+            deltas   = _sample_flow_at_points(flow, prev_xy)     # (N, 2)
+            prop_xy  = prev_xy + deltas                           # (N, 2)
+        else:
+            prop_xy = np.empty((0, 2))
+
+        # --- Step 2: match propagated points to new detections ---
+        matched_track_ids = set()
+        matched_det_ids   = set()
+
+        if len(self.tracks) > 0 and len(det_xy) > 0:
+            dist = _distance_matrix(prop_xy, det_xy)            # (N, M)
+            row_ind, col_ind = linear_sum_assignment(dist)
+
+            for r, c in zip(row_ind, col_ind):
+                if dist[r, c] <= self.dist_threshold:
+                    self.tracks[r].update(det_xy[c])
+                    matched_track_ids.add(r)
+                    matched_det_ids.add(c)
+
+        # --- Step 3: mark unmatched tracks as missed ---
+        for i, t in enumerate(self.tracks):
+            if i not in matched_track_ids:
+                t.mark_missed()
+
+        # --- Step 4: initialise new tracks from unmatched detections ---
+        for j in range(len(det_xy)):
+            if j not in matched_det_ids:
+                self.tracks.append(PointTrack(det_xy[j], 1.0, int(det_types[j])))
+
+        # --- Step 5: confirm and prune ---
+        for t in self.tracks:
+            if t.hits >= self.min_hits:
+                t.confirmed = True
+
+        self.tracks = [t for t in self.tracks if t.miss <= self.max_miss]
+
+        return [
+            {"id": t.id, "xy": t.xy, "type": t.type, "hits": t.hits}
+            for t in self.tracks if t.confirmed
+        ]
