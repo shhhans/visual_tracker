@@ -1,13 +1,21 @@
+from .unet import UNet
 from .backbone import ResNetBackbone
 from .neck import FPN
 from .head import FCOSHead
-from .detector import Detector
-from .tracker import ByteTracker, FlowPointTracker
 from .flownet import FlowNetC
 from .keypoint_head import KeypointHead
 
 __all__ = [
-    "ResNetBackbone", "FPN", "FCOSHead", "Detector",
-    "ByteTracker", "FlowPointTracker",
+    "UNet",
+    "ResNetBackbone", "FPN", "FCOSHead",
     "FlowNetC", "KeypointHead",
 ]
+
+# Heavy deps (torchvision required) — imported lazily
+def _load_detector():
+    from .detector import Detector
+    return Detector
+
+def _load_trackers():
+    from .tracker import ByteTracker, FlowPointTracker
+    return ByteTracker, FlowPointTracker
