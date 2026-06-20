@@ -1,0 +1,55 @@
+model:
+  backbone:
+    type: "ResNetBackbone"
+    depth: 50          # 18 | 34 | 50
+    pretrained: true
+    out_indices: [1, 2, 3, 4]   # C2 C3 C4 C5
+  neck:
+    type: "FPN"
+    in_channels: [256, 512, 1024, 2048]
+    out_channels: 256
+    num_levels: 5
+  head:
+    type: "FCOSHead"
+    in_channels: 256
+    num_classes: 80
+    strides: [8, 16, 32, 64, 128]
+
+loss:
+  cls_loss_weight: 1.0
+  reg_loss_weight: 1.0
+  centerness_loss_weight: 1.0
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+
+tracker:
+  iou_threshold: 0.3
+  max_age: 30          # frames before track is deleted
+  min_hits: 3          # hits before track is confirmed
+  use_kalman: true
+
+data:
+  train_ann: "data/annotations/instances_train2017.json"
+  train_img: "data/train2017"
+  val_ann:   "data/annotations/instances_val2017.json"
+  val_img:   "data/val2017"
+  num_workers: 4
+  img_size: 640
+  augment: true
+
+train:
+  epochs: 100
+  batch_size: 8
+  lr: 0.01
+  momentum: 0.9
+  weight_decay: 1.0e-4
+  lr_scheduler: "cosine"  # cosine | step
+  warmup_epochs: 3
+  grad_clip: 10.0
+  save_dir: "checkpoints"
+  log_interval: 50
+
+eval:
+  conf_threshold: 0.05
+  nms_iou_threshold: 0.6
+  max_detections: 300
