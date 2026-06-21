@@ -119,19 +119,22 @@ def _render_frame(h: int, w: int,
                   lighting_gradient: float = 0.0,
                   antialias: bool = False,
                   gaussian_noise: float = 0.0,
-                  freq_mode: str = "low") -> Tuple[np.ndarray, np.ndarray]:
+                  freq_mode: str = "low",
+                  soft_label_sigma: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
     """
     Render one frame.
 
-    antialias      : render at 2× resolution then downsample (INTER_AREA)
-                     → smooths the staircase alias on polygon edges
-    gaussian_noise : std of additive Gaussian noise in [0, 1] pixel range
-                     (applied after render; 0 = no noise)
-    freq_mode      : "low" | "high" — texture spatial frequency
+    antialias        : render at 2× resolution then downsample (INTER_AREA)
+                       → smooths the staircase alias on polygon edges
+    gaussian_noise   : std of additive Gaussian noise in [0, 1] pixel range
+                       (applied after render; 0 = no noise)
+    freq_mode        : "low" | "high" — texture spatial frequency
+    soft_label_sigma : if > 0, apply Gaussian blur (σ px) to the edge mask
+                       after downsampling, producing a smooth heatmap target
 
     Returns:
         image     : (H, W, 3) uint8
-        edge_mask : (H, W) float32  — soft in [0,1] when antialias=True
+        edge_mask : (H, W) float32  — soft in [0,1] when antialias or sigma>0
     """
     ss = 2 if antialias else 1      # supersample factor
     rh, rw = h * ss, w * ss
@@ -182,6 +185,11 @@ def _render_frame(h: int, w: int,
         noise = np.random.randn(*image.shape).astype(np.float32) * gaussian_noise * 255
         image = np.clip(image.astype(np.float32) + noise, 0, 255).astype(np.uint8)
 
+    # Soft label: blur edge mask to a smooth heatmap
+    if soft_label_sigma > 0:
+        edge_mask = cv2.GaussianBlur(edge_mask, (0, 0), soft_label_sigma)
+        edge_mask = np.clip(edge_mask / (edge_mask.max() + 1e-6), 0.0, 1.0)
+
     return image, edge_mask
 
 
@@ -216,6 +224,7 @@ class SyntheticEdgeDataset:
         antialias:         bool  = False,
         gaussian_noise:    float = 0.0,
         freq_mode:         str   = "low",
+        soft_label_sigma:  float = 0.0,
     ):
         self.size             = size
         self.texture_strength = texture_strength
@@ -228,6 +237,7 @@ class SyntheticEdgeDataset:
         self.antialias        = antialias
         self.gaussian_noise   = gaussian_noise
         self.freq_mode        = freq_mode
+        self.soft_label_sigma = soft_label_sigma
 
     def __len__(self) -> int:
         return self.length
@@ -263,6 +273,7 @@ class SyntheticEdgeDataset:
             antialias          = self.antialias,
             gaussian_noise     = self.gaussian_noise,
             freq_mode          = self.freq_mode,
+            soft_label_sigma   = self.soft_label_sigma,
         )
 
         sample = {
@@ -284,6 +295,7 @@ class SyntheticEdgeDataset:
                 antialias          = self.antialias,
                 gaussian_noise     = self.gaussian_noise,
                 freq_mode          = self.freq_mode,
+                soft_label_sigma   = self.soft_label_sigma,
             )
 
             # Ground-truth flow at boundary pixels of frame t:
