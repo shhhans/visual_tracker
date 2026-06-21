@@ -16,3 +16,4 @@ output*.mp4
 .DS_Store
 .venv/
 venv/
+debug_samples/
