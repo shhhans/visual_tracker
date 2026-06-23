@@ -1,7 +1,7 @@
 """COCO-style mean Average Precision."""
 import torch
 import numpy as np
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 
 class MeanAveragePrecision:

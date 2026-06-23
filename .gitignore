@@ -5,9 +5,7 @@ __pycache__/
 dist/
 build/
 .eggs/
-*.pt
 *.pth
-checkpoints/
 runs/
 data/train2017/
 data/val2017/
@@ -16,3 +14,4 @@ output*.mp4
 .DS_Store
 .venv/
 venv/
+debug_samples/
