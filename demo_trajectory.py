@@ -120,9 +120,60 @@ def infer_heatmap(model: UNet, img: np.ndarray) -> np.ndarray:
 
 # ─── 刚体变换估计（从相邻帧热力图）────────────────────────────────────────────
 
+def template_match_orientation(hm: np.ndarray, cx: float, cy: float,
+                               half: int, n_sides: int,
+                               n_edge_samples: int = 30) -> float:
+    """
+    通过边缘模板匹配估计方向角（度）。
+
+    对 n 折对称体只需扫描一个周期 [0°, 360°/n)。
+    在每个候选角度下，沿理想多边形的各条边均匀采样热力图值，
+    取累加和最大时对应的角度。
+
+    与 PCA 的根本区别：正六边形的边界协方差矩阵是各向同性的
+    （与单位矩阵成正比），PCA 主轴不稳定，任何微小热力图噪声都
+    会引起 15°-30° 的随机误差。模板匹配则直接利用 Path1 输出的
+    边缘热力图与已知几何形状对齐，误差来源仅为网络不准确，不存
+    在几何退化问题。
+    """
+    H, W    = hm.shape
+    period  = 360 // n_sides          # 六边形 → 60
+    best_val = -1.0
+    best_deg = 0.0
+
+    for deg in range(period):
+        total = 0.0
+        for k in range(n_sides):
+            # 当前边的两个顶点
+            theta0 = math.radians(deg + k       * 360.0 / n_sides)
+            theta1 = math.radians(deg + (k + 1) * 360.0 / n_sides)
+            x0 = cx + half * math.cos(theta0)
+            y0 = cy + half * math.sin(theta0)
+            x1 = cx + half * math.cos(theta1)
+            y1 = cy + half * math.sin(theta1)
+            # 沿边均匀采样
+            for j in range(n_edge_samples):
+                t  = (j + 0.5) / n_edge_samples
+                sx = x0 + t * (x1 - x0)
+                sy = y0 + t * (y1 - y0)
+                xi = int(round(sx))
+                yi = int(round(sy))
+                if 0 <= xi < W and 0 <= yi < H:
+                    total += hm[yi, xi]
+        if total > best_val:
+            best_val = total
+            best_deg = float(deg)
+
+    return best_deg
+
+
 def heatmap_to_pose(hm: np.ndarray, thr: float = HM_THR):
     """
-    从热力图估计质心 (cx, cy) 和 PCA 主轴角度 φ (degrees)。
+    从热力图估计质心 (cx, cy) 和方向角 φ (degrees)。
+
+    质心：热力图加权中心。
+    方向：边缘模板匹配（非 PCA）。
+      PCA 在正六边形等各向同性形状上完全退化，模板匹配更稳定。
 
     Returns (cx, cy, angle_deg) or None if too few pixels.
     """
@@ -136,31 +187,31 @@ def heatmap_to_pose(hm: np.ndarray, thr: float = HM_THR):
     cx = float((weights * xs).sum() / w_sum)
     cy = float((weights * ys).sum() / w_sum)
 
-    # PCA：中心化后的协方差矩阵主方向
-    dx = xs - cx
-    dy = ys - cy
-    cov = np.array([
-        [(weights * dx * dx).sum(), (weights * dx * dy).sum()],
-        [(weights * dx * dy).sum(), (weights * dy * dy).sum()],
-    ]) / w_sum
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    major = eigvecs[:, eigvals.argmax()]         # 最大特征向量
-    angle = float(math.degrees(math.atan2(major[1], major[0])))
+    angle = template_match_orientation(hm, cx, cy, HALF, _N_SIDES)
     return cx, cy, angle
 
 
-def angle_diff_symmetric(a_new: float, a_old: float, symmetry: int) -> float:
+def angle_error_symmetric(pred_a: float, gt_a: float, n_sides: int) -> float:
     """
-    旋转对称体的角度差：n 折对称时，每隔 360/n 度外观重复。
-    选择 |diff| 最小的等价角度。
+    考虑 n 折对称性的角度误差。
+    将差值折叠到 [0, period/2) 内，period = 360/n_sides。
     """
-    period = 360.0 / symmetry
-    diff   = (a_new - a_old) % 360.0
-    # 折叠到 [0, period)
-    diff   = diff % period
+    period = 360.0 / n_sides
+    diff   = (pred_a - gt_a) % period
     if diff > period / 2:
         diff -= period
-    return diff
+    return abs(diff)
+
+
+def pred_angle_to_gt_branch(pred_a: float, gt_a: float, n_sides: int) -> float:
+    """
+    将模板匹配角度（在 [0, period) 内）映射到与 GT 最近的等价角度，
+    用于绘图时与 GT 在同一分支上比较。
+    """
+    period = 360.0 / n_sides
+    diff   = gt_a - pred_a
+    k      = round(diff / period)
+    return pred_a + k * period
 
 
 # ─── 主流程 ──────────────────────────────────────────────────────────────────
@@ -242,12 +293,15 @@ def visualize(gt_poses, pred_poses, frame_errors, sample_data, model):
     gt_a = [p[2] for p in gt_poses]
     pr_x = [p[0] for p in pred_poses]
     pr_y = [p[1] for p in pred_poses]
-    pr_a = [p[2] for p in pred_poses]
+    # Map predicted angles to the same branch as GT for clean visualization
+    pr_a = [pred_angle_to_gt_branch(pred_poses[t][2], gt_poses[t][2], _N_SIDES)
+            for t in range(len(pred_poses))]
 
     angle_errors = []
     for t in range(1, N_FRAMES + 1):
-        raw = abs(pred_poses[t][2] - gt_poses[t][2]) % 360
-        angle_errors.append(raw if raw <= 180 else 360 - raw)
+        angle_errors.append(
+            angle_error_symmetric(pred_poses[t][2], gt_poses[t][2], _N_SIDES)
+        )
 
     # ── 主图 ──────────────────────────────────────────────────────────────────
     fig = plt.figure(figsize=(15, 9))
@@ -349,7 +403,9 @@ def visualize(gt_poses, pred_poses, frame_errors, sample_data, model):
         # Col 2: GT vs Pred pose overlay
         overlay = img_t.copy()
         cx_gt, cy_gt, a_gt = pose_gt
-        cx_pr, cy_pr, a_pr = pose_pred
+        cx_pr, cy_pr, a_pr_raw = pose_pred
+        # Map predicted angle to GT branch for overlay display
+        a_pr = pred_angle_to_gt_branch(a_pr_raw, a_gt, _N_SIDES)
 
         # GT outline
         gt_obj = ObjectState(cx_gt, cy_gt, HALF, a_gt, _N_SIDES)
@@ -364,8 +420,9 @@ def visualize(gt_poses, pred_poses, frame_errors, sample_data, model):
 
         axes[row, 2].imshow(overlay)
         axes[row, 2].axis("off")
+        ang_err = angle_error_symmetric(a_pr_raw, a_gt, _N_SIDES)
         axes[row, 2].set_xlabel(
-            f"pos_err={pos_err:.2f}px", fontsize=7, labelpad=2
+            f"pos={pos_err:.2f}px  ang={ang_err:.1f}°", fontsize=7, labelpad=2
         )
 
     fig2.suptitle(
